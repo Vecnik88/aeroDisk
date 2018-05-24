@@ -161,9 +161,9 @@ static int __init ta_blkdev_init(void)
 	struct pci_dev *pdev = NULL;
 
 	blkdev_kset = kset_create_and_add(TA_MODULE_NAME, NULL, kernel_kobj);
-	if (unlikely(!blkdev_kset)) {
+	if (unlikely(!blkdev_kset))
 		return -ENOMEM;
-	}
+
 	for_each_pci_dev(pdev) {
 		pci_read_config_word(pdev, PCI_CLASS_DEVICE, &data);
 		if (ta_pci_dev_is_real_blkdev(data)) {
