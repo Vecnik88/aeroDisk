@@ -163,23 +163,20 @@ static int __init ta_blkdev_init(void)
 
 	blkdev_kset = kset_create_and_add(TA_MODULE_NAME, NULL, kernel_kobj);
 	if (unlikely(!blkdev_kset)) {
-		err = -ENOMEM;
-		goto err_exit;
+		return -ENOMEM;
 	}
 	for_each_pci_dev(pdev) {
 		pci_read_config_word(pdev, PCI_CLASS_DEVICE, &data);
 		if (ta_pci_dev_is_real_blkdev(data)) {
 			disk = dev_to_disk(&pdev->dev);
 			if (unlikely(!disk)) {
-				err = -EINVAL;
 				ta_destroy_kset(blkdev_kset);
-				goto err_exit;
+				return -EINVAL;
 			}
 			if (unlikely(!ta_create_aero_dev(blkdev_kset,
 			                                 disk, pdev))) {
-				err = -EINVAL;
 				ta_destroy_kset(blkdev_kset);
-				goto err_exit;
+				return -EINVAL;
 			}
 			ta_blkdev_log("WWN %x:%x, capacity=%llu\n",
 			              pdev->vendor, pdev->device,
@@ -188,8 +185,7 @@ static int __init ta_blkdev_init(void)
 	}
 	ta_blkdev_log("loading\n");
 
-err_exit:
-	return err;
+	return 0;
 }
 
 static void __exit ta_blkdev_exit(void)
