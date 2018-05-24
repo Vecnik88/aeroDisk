@@ -157,7 +157,6 @@ static void ta_destroy_kset(struct kset *kset)
 static int __init ta_blkdev_init(void)
 {
 	u16 data;
-	int err = 0;
 	struct gendisk *disk;
 	struct pci_dev *pdev = NULL;
 
