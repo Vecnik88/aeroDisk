@@ -140,8 +140,10 @@ static struct ta_aero_dev __must_check *ta_create_adev(struct pci_dev *pdev,
 		ata_for_each_dev(tdev, &ap->link, ENABLED) {
 			if (ata_id_has_wwn(tdev->id)) {
 				aero->id = tdev->id;
-				aero->disk_sizeb += tdev->n_sectors * ATA_SECT_SIZE;
-				ata_id_string(tdev->id, buf, ATA_ID_WWN, ATA_ID_WWN_LEN);
+				aero->disk_sizeb +=
+					tdev->n_sectors * ATA_SECT_SIZE;
+				ata_id_string(tdev->id, buf,
+				              ATA_ID_WWN, ATA_ID_WWN_LEN);
 				aero->wwn = be64_to_cpu(*((__force __be64 *)buf));
 			}
 		}
@@ -160,7 +162,7 @@ static struct ta_aero_dev __must_check *ta_create_adev(struct pci_dev *pdev,
 	return aero;
 }
 
-static void ta_destroy_kset(struct kset *kset)
+static void __cold ta_destroy_kset(struct kset *kset)
 {
 	struct kobject *kobj;
 	struct list_head *list_node, *list_tmp;
