@@ -1,21 +1,22 @@
 #include <linux/fs.h>
+#include <linux/ata.h>
 #include <linux/pci.h>
 #include <linux/init.h>
 #include <linux/slab.h>
-#include <linux/genhd.h>
 #include <linux/sysfs.h>
+#include <linux/libata.h>
 #include <linux/module.h>
 #include <linux/kobject.h>
 
 #define TA_MODULE_NAME  "aeroDisk"
 
-static struct kset *blkdev_kset;
+static struct kset *bdev_kset;
 
 struct ta_aero_dev {
-	struct kobject kobj;
-	u16            vendor_id;
-	u16            device_id;
-	sector_t       capacity;
+	struct kobject  kobj;
+	u16            *id;
+	u64             wwn;
+	u64             disk_sizeb;
 };
 
 struct ta_attribute {
@@ -33,7 +34,7 @@ struct ta_attribute {
 #define kobj_to_aero(aero)    \
 	container_of(aero, struct ta_aero_dev, kobj)
 
-static bool ta_pci_dev_is_real_blkdev(u16 data)
+static bool __must_check ta_pci_dev_is_real_blkdev(u16 data)
 {
 	switch (data) {
 	case PCI_CLASS_STORAGE_IDE:
@@ -46,13 +47,13 @@ static bool ta_pci_dev_is_real_blkdev(u16 data)
 	}
 }
 
-static ssize_t ta_capacity_show(struct ta_aero_dev *aero,
-                                struct ta_attribute *attr, char *buf)
+static ssize_t ta_size_show(struct ta_aero_dev *aero,
+                            struct ta_attribute *attr, char *buf)
 {
 	if (unlikely(!aero))
 		return -EIO;
 
-	return sprintf(buf, "%llu\n", (__force unsigned long long)aero->capacity);
+	return sprintf(buf, "%llu\n", aero->disk_sizeb);
 }
 
 static ssize_t ta_disk_id_show(struct ta_aero_dev *aero,
@@ -61,7 +62,7 @@ static ssize_t ta_disk_id_show(struct ta_aero_dev *aero,
 	if (unlikely(!aero))
 		return -EIO;
 
-	return sprintf(buf, "%x:%x\n", aero->vendor_id, aero->device_id);
+	return sprintf(buf, "0x%llx\n", aero->wwn);
 }
 
 static void ta_aero_release(struct kobject *kobj)
@@ -72,13 +73,13 @@ static void ta_aero_release(struct kobject *kobj)
 	kfree(aero);
 }
 
-static struct ta_attribute capacity_attribute =
-	__ATTR(capacity, S_IRUGO | S_IWUSR, ta_capacity_show, NULL);
+static struct ta_attribute size_attribute =
+	__ATTR(size, S_IRUGO | S_IWUSR, ta_size_show, NULL);
 static struct ta_attribute disk_id_attribute =
 	__ATTR(disk_id, S_IRUGO | S_IWUSR, ta_disk_id_show, NULL);
 
 static struct attribute *aero_default_attrs[] = {
-	&capacity_attribute.attr,
+	&size_attribute.attr,
 	&disk_id_attribute.attr,
 	NULL,
 };
@@ -113,22 +114,38 @@ static void ta_destroy_aero_dev(struct ta_aero_dev *aero)
 	kobject_put(&aero->kobj);
 }
 
-static struct ta_aero_dev *ta_create_aero_dev(struct kset *blkdev_kset,
-                                              struct gendisk *disk,
-                                              struct pci_dev *pdev)
+static struct ta_aero_dev __must_check *ta_create_adev(struct pci_dev *pdev,
+                                                       struct kset *bdev_kset)
 {
-	int err;
+	int i, err;
+	struct ata_port *ap;
+	struct ata_host *host;
+	struct ata_device *tdev;
 	struct ta_aero_dev *aero;
+	unsigned char buf[ATA_ID_WWN_LEN];
 
 	aero = kzalloc(sizeof(*aero), GFP_KERNEL);
 	if (unlikely(!aero))
 		return NULL;
 
-	aero->kobj.kset = blkdev_kset;
-	aero->vendor_id = pdev->vendor;
-	aero->device_id = pdev->device;
-	aero->capacity = get_capacity(disk);
+	aero->kobj.kset = bdev_kset;
+	host = pci_get_drvdata(pdev);
+	if (unlikely(!host)) {
+		kobject_put(&aero->kobj);
+		return NULL;
+	}
 
+	for (i = 0; i < host->n_ports; ++i) {
+		ap = host->ports[i];
+		ata_for_each_dev(tdev, &ap->link, ENABLED) {
+			if (ata_id_has_wwn(tdev->id)) {
+				aero->id = tdev->id;
+				aero->disk_sizeb += tdev->n_sectors * ATA_SECT_SIZE;
+				ata_id_string(tdev->id, buf, ATA_ID_WWN, ATA_ID_WWN_LEN);
+				aero->wwn = be64_to_cpu(*((__force __be64 *)buf));
+			}
+		}
+	}
 	err = kobject_init_and_add(&aero->kobj, &aero_ktype,
 	                           NULL, "%s", dev_name(&pdev->dev));
 	if (unlikely(err)) {
@@ -136,6 +153,9 @@ static struct ta_aero_dev *ta_create_aero_dev(struct kset *blkdev_kset,
 		return NULL;
 	}
 	kobject_uevent(&aero->kobj, KOBJ_ADD);
+
+	ta_blkdev_log("WWN: 0x%llx, disk size in bytes=%llu\n",
+	              aero->wwn, aero->disk_sizeb);
 
 	return aero;
 }
@@ -157,29 +177,19 @@ static void ta_destroy_kset(struct kset *kset)
 static int __init ta_blkdev_init(void)
 {
 	u16 data;
-	struct gendisk *disk;
 	struct pci_dev *pdev = NULL;
 
-	blkdev_kset = kset_create_and_add(TA_MODULE_NAME, NULL, kernel_kobj);
-	if (unlikely(!blkdev_kset))
+	bdev_kset = kset_create_and_add(TA_MODULE_NAME, NULL, kernel_kobj);
+	if (unlikely(!bdev_kset))
 		return -ENOMEM;
 
 	for_each_pci_dev(pdev) {
 		pci_read_config_word(pdev, PCI_CLASS_DEVICE, &data);
 		if (ta_pci_dev_is_real_blkdev(data)) {
-			disk = dev_to_disk(&pdev->dev);
-			if (unlikely(!disk)) {
-				ta_destroy_kset(blkdev_kset);
+			if (unlikely(!ta_create_adev(pdev, bdev_kset))) {
+				ta_destroy_kset(bdev_kset);
 				return -EINVAL;
 			}
-			if (unlikely(!ta_create_aero_dev(blkdev_kset,
-			                                 disk, pdev))) {
-				ta_destroy_kset(blkdev_kset);
-				return -EINVAL;
-			}
-			ta_blkdev_log("WWN %x:%x, capacity=%llu\n",
-			              pdev->vendor, pdev->device,
-			              (__force unsigned long long)get_capacity(disk));
 		}
 	}
 	ta_blkdev_log("loading\n");
@@ -189,7 +199,7 @@ static int __init ta_blkdev_init(void)
 
 static void __exit ta_blkdev_exit(void)
 {
-	ta_destroy_kset(blkdev_kset);
+	ta_destroy_kset(bdev_kset);
 
 	ta_blkdev_log("unloading\n");
 }
@@ -200,3 +210,4 @@ module_exit(ta_blkdev_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Testing ask aeroDisk");
 MODULE_AUTHOR("Anton Mikaev ve_cni_k@inbox.ru");
+MODULE_VERSION("0.02");
